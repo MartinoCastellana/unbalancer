@@ -71,6 +71,106 @@ La prima famiglia prevista comprende:
 
 Il SOM può scegliere un algoritmo singolo oppure una politica combinata con pesi. Non tutti gli algoritmi devono essere applicati a ogni richiesta: tutti contribuiscono al sistema, ma la strategia attiva dipende dal contesto.
 
+## Esempi di utilizzo
+
+Questi esempi descrivono il comportamento progettato di Unbalancer. Non rappresentano ancora comandi eseguibili: il runtime verrà implementato nelle fasi successive.
+
+### Avvio concettuale
+
+```bash
+# Avvio del proxy Unbalancer
+unbalancer start --config configs/unbalancer.yaml
+
+# Avvio della simulazione locale
+cd simulator
+npm run dev
+```
+
+Una configurazione iniziale potrà avere questa forma:
+
+```yaml
+listen: ":8080"
+som:
+  enabled: true
+  provider: ollama
+  model: qwen3:0.6b
+  decision_interval: 5s
+  cooldown: 30s
+backends:
+  - id: server-01
+    url: http://127.0.0.1:9001
+    weight: 1
+  - id: server-02
+    url: http://127.0.0.1:9002
+    weight: 2
+```
+
+### Traffico stabile e omogeneo
+
+Quando i backend hanno capacità simili, latenza bassa e un error rate regolare, il SOM può mantenere Weighted Round Robin o Weighted Least Connections. In questo caso non è utile cambiare strategia frequentemente: la stabilità della policy è più importante di una micro-ottimizzazione.
+
+```text
+condizione: server equivalenti, latenza p95 stabile
+scelta: weighted_round_robin
+azione: nessuna penalità, cooldown lungo
+motivo: distribuzione uniforme con overhead minimo
+```
+
+### API sensibili alla latenza
+
+Per richieste brevi e sensibili ai tempi di risposta, il SOM può preferire Least Response Time o EWMA latency. La decisione usa una finestra temporale, in modo da non reagire a un singolo outlier.
+
+```text
+condizione: p95 in aumento, connessioni brevi
+scelta: least_response_time o ewma_latency
+azione: preferenza ai backend con latenza recente più bassa
+motivo: minimizzare la latenza percepita dal client
+```
+
+### Sessioni lunghe o WebSocket
+
+Quando le sessioni restano attive a lungo, il SOM deve considerare il numero di connessioni più della sola latenza istantanea. Può usare Least Connections insieme a session affinity o Consistent Hashing.
+
+```text
+condizione: sessioni persistenti e durata elevata
+scelta: least_connections + session_affinity
+azione: evitare di concentrare nuove sessioni sui backend già occupati
+motivo: proteggere la capacità residua e mantenere la continuità
+```
+
+### Cache, file e contenuti ripetuti
+
+Per traffico che beneficia della cache locale, il SOM può selezionare Consistent Hashing o IP Hash. L'obiettivo non è distribuire perfettamente ogni richiesta, ma mantenere la stessa chiave sullo stesso backend finché questo rimane disponibile.
+
+```text
+condizione: richieste ripetibili con chiave o sessione
+scelta: consistent_hashing
+azione: minimizzare la migrazione delle chiavi
+motivo: aumentare il riuso della cache
+```
+
+### Picchi improvvisi
+
+Durante un burst, il SOM può passare a Power of Two Choices o Least Connections. Invece di valutare tutti i backend in modo costoso, Power of Two Choices confronta due candidati e seleziona quello meno carico.
+
+```text
+condizione: throughput oltre la soglia di burst
+scelta: power_of_two_choices
+azione: distribuire rapidamente le nuove richieste
+motivo: decisione veloce con buona distribuzione del carico
+```
+
+### Server con capacità diverse
+
+Se un backend ha più CPU, memoria o istanze disponibili, il SOM può usare Weighted Least Connections o Resource-aware Routing. Il peso non sarà fisso per sempre: potrà essere corretto in base agli outcome osservati.
+
+```text
+condizione: capacità eterogenea
+scelta: weighted_least_connections
+azione: assegnare più traffico ai backend con maggiore capacità libera
+motivo: evitare che l'equità numerica diventi inefficienza
+```
+
 ## Decisioni, sessioni e memoria
 
 Per ogni ciclo decisionale il sistema conserva:
@@ -95,6 +195,170 @@ latenza alta
 ```
 
 Le penalità avranno durata, soglie e cooldown configurabili per evitare oscillazioni continue tra algoritmi e backend.
+
+## Logiche decisionali del sistema
+
+Il SOM seguirà una pipeline a più livelli. Il modello Ollama proporrà la politica, ma il controllo finale resterà nel Decision Plane.
+
+### 1. Raccolta dello stato
+
+Il sistema costruisce uno snapshot su una finestra temporale configurabile. Le informazioni principali sono:
+
+- richieste al secondo e trend del traffico;
+- sessioni attive, completate, fallite e terminate per timeout;
+- latenza media, p95, p99 e variazione recente;
+- error rate e numero di retry;
+- connessioni attive per backend;
+- CPU, memoria, throughput e capacità residua;
+- health check e stato del circuit breaker;
+- algoritmo corrente e risultati delle ultime decisioni.
+
+### 2. Safety gates
+
+Prima di chiedere una nuova strategia al SOM, Unbalancer applica regole non delegabili al modello:
+
+1. un backend unhealthy non può ricevere nuove sessioni;
+2. un backend in circuit breaker viene escluso;
+3. un algoritmo incompatibile con il tipo di sessione viene scartato;
+4. una policy con pesi invalidi viene rifiutata;
+5. deve rimanere almeno un backend disponibile;
+6. non è consentito cambiare policy durante il cooldown, salvo emergenza;
+7. il modello non può aumentare la priorità di un backend penalizzato senza segnali di recupero.
+
+### 3. Classificazione del traffico
+
+Il SOM classifica il contesto prima di scegliere l'algoritmo:
+
+| Contesto rilevato | Segnali principali | Strategie candidate |
+|---|---|---|
+| Stable | varianza bassa, errori bassi | Round Robin, Weighted Round Robin |
+| Latency-sensitive | p95/p99 in aumento | Least Response Time, EWMA |
+| Connection-heavy | molte sessioni attive | Least Connections, Power of Two |
+| Burst | aumento rapido del throughput | Power of Two, Least Connections |
+| Sticky | sessioni o chiavi persistenti | Consistent Hashing, IP Hash |
+| Heterogeneous | capacità diverse | Weighted Least Connections, Resource-aware |
+| Degraded | errori, timeout o latenza anomala | Failover, circuit breaker, policy alternativa |
+
+### 4. Scoring dei candidati
+
+Ogni strategia riceve un punteggio calcolato sulle metriche normalizzate. Un valore più basso indica una scelta migliore:
+
+```text
+score =
+  w_latency   * latency_cost
++ w_sessions  * active_sessions_cost
++ w_errors    * error_cost
++ w_capacity  * capacity_cost
++ w_history   * historical_outcome_cost
++ w_switch    * policy_switch_cost
+```
+
+Il termine `policy_switch_cost` evita di cambiare algoritmo per differenze insignificanti. I pesi dipendono dal contesto: durante un degrado aumentano errori e latenza; durante un traffico stabile aumenta il costo del cambio.
+
+### 5. Decisione e validazione
+
+Il SOM produce una proposta. Il sistema la confronta con la policy corrente e applica una nuova policy solo se:
+
+- il miglioramento atteso supera una soglia minima;
+- la proposta supera i safety gates;
+- il cambio non viola cooldown e hysteresis;
+- esiste una motivazione registrabile;
+- il risultato JSON rispetta lo schema.
+
+Se il SOM non risponde, Unbalancer conserva l'ultima policy valida e può applicare un fallback deterministico basato sulle metriche locali.
+
+### 6. Feedback dagli outcome
+
+Dopo l'esecuzione, il sistema confronta la previsione con l'esito reale. Una policy che riduce p99 ed error rate riceve un outcome positivo; una policy che causa timeout, sbilanciamento o oscillazioni riceve una penalità.
+
+```text
+snapshot -> classificazione -> candidate scoring -> proposta SOM
+       -> safety gates -> policy attiva -> outcome -> decision journal
+```
+
+## Case history decisionali
+
+Le seguenti case history saranno usate nella simulazione e nei benchmark.
+
+### Case history 1 — Un backend diventa lento
+
+**Situazione iniziale:** quattro backend ricevono traffico con Weighted Least Connections. `server-02` passa da 90ms a 850ms di p95 per tre finestre consecutive.
+
+**Decisione:**
+
+1. il health check risponde ancora, quindi il server non viene rimosso immediatamente;
+2. il Decision Plane applica una penalità iniziale;
+3. il SOM classifica il contesto come `Degraded` e propone Least Response Time;
+4. `server-02` passa a priorità bassa;
+5. le nuove sessioni vengono preferite sugli altri backend;
+6. dopo il cooldown il sistema rivaluta il comportamento.
+
+**Risultato atteso:** riduzione del p95 e mantenimento delle sessioni già attive senza oscillare tra inclusione ed esclusione.
+
+### Case history 2 — Picco improvviso
+
+**Situazione iniziale:** il traffico passa da 150 a 900 richieste al secondo in pochi secondi.
+
+**Decisione:**
+
+1. il trend supera la soglia `burst_rate`;
+2. il SOM aumenta il peso di Power of Two Choices;
+3. le richieste vengono confrontate su candidati con meno connessioni;
+4. il sistema registra l'overhead e il tempo di convergenza;
+5. terminato il picco, il SOM non ripristina subito la policy precedente: attende una finestra stabile.
+
+**Risultato atteso:** assorbimento del burst con meno concentrazione su un singolo backend.
+
+### Case history 3 — Capacità non uniforme
+
+**Situazione iniziale:** `server-01` ha il doppio della capacità di `server-03`, ma entrambi ricevono lo stesso numero di richieste con Round Robin.
+
+**Decisione:**
+
+1. il sistema osserva CPU, memoria e latenza relative;
+2. identifica che la distribuzione numerica non è proporzionale alla capacità;
+3. il SOM propone Weighted Least Connections;
+4. il peso iniziale viene calcolato dalla capacità dichiarata;
+5. l'outcome corregge il peso se la latenza reale non conferma la previsione.
+
+**Risultato atteso:** utilizzo più equilibrato della capacità senza sovraccaricare il backend più piccolo.
+
+### Case history 4 — Errore e recupero
+
+**Situazione iniziale:** `server-04` restituisce errori 5xx e timeout. Dopo un periodo offline torna disponibile.
+
+**Decisione:**
+
+1. il circuit breaker impedisce nuove sessioni;
+2. il sistema registra gli errori e il motivo di terminazione;
+3. gli health check confermano il recupero;
+4. il backend rientra con una quota minima di traffico;
+5. se gli outcome sono positivi, la priorità aumenta gradualmente;
+6. se ricompaiono timeout, il backend torna in stato degradato.
+
+**Risultato atteso:** recupero controllato senza riversare immediatamente traffico su un server instabile.
+
+## Esempio di decision journal
+
+```json
+{
+  "timestamp": "2026-10-14T12:41:08Z",
+  "scenario": "slow_backend",
+  "current_algorithm": "weighted_least_connections",
+  "proposed_algorithm": "least_response_time",
+  "trigger": "server-02 p95 latency above threshold",
+  "active_sessions": 412,
+  "backend_state": {
+    "server-01": { "latency_p95_ms": 118, "error_rate": 0.2, "priority": 1 },
+    "server-02": { "latency_p95_ms": 850, "error_rate": 4.8, "priority": 4 }
+  },
+  "action": "penalize_backend",
+  "cooldown_seconds": 30,
+  "outcome": "pending"
+}
+```
+
+L'evento verrà completato quando la finestra di osservazione successiva avrà misurato l'effetto della decisione.
 
 ## Integrazione con Ollama
 
