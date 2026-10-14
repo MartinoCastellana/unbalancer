@@ -1,0 +1,36 @@
+project: unbalancer
+
+workload:
+  name: stable-traffic
+  warmup_seconds: 30
+  duration_seconds: 120
+  repetitions: 5
+  requests_per_second: 100
+  seed: 42
+
+backends:
+  - id: server-1
+    url: http://127.0.0.1:9001
+    weight: 1
+  - id: server-2
+    url: http://127.0.0.1:9002
+    weight: 1
+  - id: server-3
+    url: http://127.0.0.1:9003
+    weight: 1
+
+baseline:
+  enabled: true
+  router: weighted_round_robin
+
+unbalancer:
+  enabled: true
+  initial_algorithm: weighted_round_robin
+  decision_interval_seconds: 5
+  som_model: qwen3:0.6b
+  record_decision_journal: true
+
+thresholds:
+  latency_p95_ms: 500
+  error_rate_percent: 5
+  recovery_cooldown_seconds: 30

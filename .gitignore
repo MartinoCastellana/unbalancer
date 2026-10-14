@@ -1,0 +1,22 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Ollama and local model artifacts
+models/
+ollama/
+*.gguf
+
+# Build and runtime output
+bin/
+dist/
+build/
+coverage/
+tmp/
+logs/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
